@@ -46,6 +46,21 @@ Rule: throwaway analysis = Python. Portfolio-grade tool = C++.
   - `examples/java21/` — fixture covering all eight buckets. Run
     `python3 reflection_audit.py --java21 --company com.example examples/java21`
     to see expected output: 4 blockers, 3 in the human queue.
+  - Fixability: add `--fixability` (needs `--bytecode`). Per site, decides
+    whether the reflection can be removed mechanically — `AUTO` (no modifier
+    change), `ASSISTED` (one-package widening), `MANUAL` (needs a decision) —
+    and refuses any widening that would trip the dispatch trap in ROADMAP's
+    safety rule.
+  - `examples/fixability/` — fixture with one site per tier, including the
+    override trap. Run:
+
+    ```
+    javac -d /tmp/fx2 $(find examples/fixability -name '*.java')
+    python3 reflection_audit.py --java21 --company com.example \
+        --bytecode /tmp/fx2 --fixability examples/fixability
+    ```
+
+    Expect 2 AUTO, 1 ASSISTED, 2 MANUAL (one override-trap, one cross-package).
   - `examples/bytecode/` — fixture for the escalation. Shows why source alone
     is not enough:
 
