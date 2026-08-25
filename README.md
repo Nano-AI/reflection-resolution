@@ -70,7 +70,8 @@ Rule: throwaway analysis = Python. Portfolio-grade tool = C++.
     # source only  -> 0 blockers, 5 opaque
     python3 reflection_audit.py --java21 --company com.example examples/bytecode
 
-    # with bytecode -> 2 blockers found, 1 opaque left (genuinely runtime-typed)
+    # with bytecode -> 2 blockers found, 2 opaque left (runtime-typed, and a
+    #                   bulk enumeration that must NOT be resolved -- see Bulk.java)
     python3 reflection_audit.py --java21 --company com.example \
         --bytecode /tmp/fx examples/bytecode
     ```

@@ -789,6 +789,11 @@ BYTECODE_LOOKUPS = (
     'getDeclaredConstructors', 'getConstructors',
 )
 
+# Lookups that take a member NAME as their first argument. The plural
+# enumerations (getDeclaredFields) and the constructor lookups take none, so
+# any String near them belongs to a different statement.
+NAMED_LOOKUPS = ('getDeclaredMethod', 'getMethod', 'getDeclaredField', 'getField')
+
 # javap output shapes.
 JAVAP_INSN = re.compile(r'^\s+(\d+): (\S+)(?:\s+#\d+)?(?:\s+// (.*))?$')
 JAVAP_LINE = re.compile(r'^\s+line (\d+): (\d+)$')
@@ -950,8 +955,14 @@ def source_line(meth: dict, offset: int):
     return best
 
 
-def resolve_from_constant_pool(insns: list, idx: int):
+def resolve_from_constant_pool(insns: list, idx: int, named: bool = True):
     """Walk backwards from a lookup call to find the class it targets.
+
+    `named` says whether this lookup takes a member name. It matters more than
+    it looks: `getDeclaredFields()` takes no arguments, so the nearest ldc
+    String belongs to some earlier statement. Consuming it invents a member,
+    and the invented member then legitimises whatever class literal comes next
+    as its owner -- two fabricated facts from one bad assumption.
 
     javac emits the receiver first, then the member name, then the parameter
     types, so scanning backwards the order is reversed: parameter class
@@ -962,6 +973,24 @@ def resolve_from_constant_pool(insns: list, idx: int):
     Returns (target_fqn_or_None, member_name_or_None).
     """
     target = member = None
+
+    if not named:
+        # No member operand to anchor on, so only the inline form is safe:
+        # `Foo.class.getDeclaredConstructor()` puts the class literal right
+        # before the call. Anything further back is guesswork -- a variable
+        # receiver here stays unresolved rather than being guessed at.
+        for j in range(idx - 1, max(0, idx - 4) - 1, -1):
+            op, comment = insns[j][1], insns[j][2]
+            if op.startswith('ldc') and comment.startswith('class '):
+                fqn = comment[len('class '):].replace('/', '.')
+                if fqn != 'java.lang.Class':
+                    return fqn, None
+            if 'java/lang/Class.forName' in comment:
+                for k in range(j - 1, max(0, j - 4) - 1, -1):
+                    if insns[k][1].startswith('ldc') and insns[k][2].startswith('String '):
+                        return insns[k][2][len('String '):], None
+        return None, None
+
     stop = max(0, idx - BACKSCAN_LIMIT)
     for j in range(idx - 1, stop - 1, -1):
         op, comment = insns[j][1], insns[j][2]
@@ -1022,7 +1051,14 @@ def bytecode_sites(classes: dict) -> list:
                 if not any(f'java/lang/Class.{L}' in comment
                            for L in BYTECODE_LOOKUPS):
                     continue
-                target, member = resolve_from_constant_pool(meth['insns'], i)
+                # The trailing colon matters: javap prints
+                # `Class.getDeclaredFields:()[...`, and "getDeclaredField" is
+                # a prefix of "getDeclaredFields", so a bare substring test
+                # calls every bulk enumeration a named lookup.
+                named = any(f'java/lang/Class.{L}:' in comment
+                            for L in NAMED_LOOKUPS)
+                target, member = resolve_from_constant_pool(
+                    meth['insns'], i, named)
                 sites.append({
                     'src_key': src_key,
                     'basename': cls['source'],
