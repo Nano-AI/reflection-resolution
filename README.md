@@ -96,7 +96,10 @@ visible statically. Everything else → human queue with tool-computed evidence
 
 - Typical legacy corpus: reflection is real but spread thin across ~150 sites,
   with no central plumbing file to fix in one place.
-- 0 hits in test paths → reflection lives in production code, not a test cheat.
+- Reflection lives in production code AND in test helpers (assertion utilities reaching
+  into private fields, unit tests resetting private static maps). Test-path sites are
+  own-code, so they are not migration blockers — but do not assume the audit surface
+  is production-only; scan `src/test` too.
 - Only `setAccessible` bypasses `private`; `forName`/`newInstance` on public members
   respect modifiers. The visibility problem is the `setAccessible` sites, not the rest.
 - `setAccessible` into the JDK is **not** automatically a Java 21 blocker. It succeeds
