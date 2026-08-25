@@ -21,6 +21,7 @@ rules behind the classification.
     python3 reflection_audit.py --java21 --json sites.json /path/to/repo
 """
 
+import argparse
 import collections
 import os
 import re
@@ -267,7 +268,19 @@ PACKAGE = re.compile(r'^\s*package\s+([\w.$]+)\s*;')
 IMPORT = re.compile(r'^\s*import\s+(?!static\b)([\w.$]+(?:\.\*)?)\s*;')
 
 # Any reflective member lookup. This is what marks a line as a "site".
-LOOKUP = re.compile(r'\.get(?:Declared)?(?:Method|Field|Constructor)s?\s*\(')
+#
+# Singular Method/Field lookups must be passed a name, so a zero-arg
+# `.getMethod()` is NOT reflection -- it is HttpServletRequest.getMethod()
+# returning "GET"/"POST", which is why the inventory mode lists it as benign.
+# Constructor lookups and the plural enumerations legitimately take no
+# arguments (`getDeclaredConstructor()`, `getDeclaredFields()`), so those
+# still count.
+LOOKUP = re.compile(
+    r'\.get(?:Declared)?(?:'
+    r'(?:Methods|Fields|Constructors)\s*\('       # bulk enumeration
+    r'|Constructor\s*\('                          # no-arg ctor lookup is real
+    r'|(?:Method|Field)\s*\(\s*[^)\s]'            # named lookup: needs an argument
+    r')')
 
 # `Foo.class.getDeclaredMethod("bar")` -> receiver simple name "Foo".
 CLASS_LITERAL_TARGET = re.compile(
@@ -1074,75 +1087,85 @@ def escalate(source_sites: list, artifact: Path, company: tuple) -> dict:
 
 
 def main() -> None:
-    args = sys.argv[1:]
+    # argparse rather than slicing sys.argv: a hand-rolled parser treats any
+    # unrecognised flag as a path, so a typo like --java-21 surfaces as
+    # "not a directory: --java-21" instead of naming the actual problem.
+    parser = argparse.ArgumentParser(
+        prog='reflection_audit.py',
+        description='Audit Java reflection, and triage it for a Java 8 -> 21 move.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            'examples:\n'
+            '  # inventory: pattern counts, hot files, clone check\n'
+            '  reflection_audit.py /path/to/repo\n'
+            '\n'
+            '  # migration triage across two repos, full inventory to JSON\n'
+            '  reflection_audit.py --java21 --json sites.json /path/repo-a /path/repo-b\n'
+            '\n'
+            '  # same, resolving targets that source alone cannot name\n'
+            '  reflection_audit.py --java21 --bytecode /path/app.war /path/repo-a\n'))
 
-    java21 = '--java21' in args
-    if java21:
-        args.remove('--java21')
+    parser.add_argument(
+        'repos', nargs='+', metavar='REPO',
+        help='repo root(s) to scan. Pass every repo at once so a call in one '
+             'that targets a class declared in another still resolves.')
+    parser.add_argument(
+        '--java21', '--java-21', dest='java21', action='store_true',
+        help='classify every site as blocking / not blocking the Java 8 -> 21 '
+             'migration, and say why. Without it, the original inventory runs.')
+    parser.add_argument(
+        '--company', metavar='PREFIX', dest='company',
+        help='package prefix meaning "our code". Overrides COMPANY_PREFIX from '
+             'the environment or .env (see .env.example). Comma-separate '
+             'several roots.')
+    parser.add_argument(
+        '--bytecode', metavar='ARTIFACT', dest='bytecode',
+        help='jar, war, or exploded-classes dir built from the same source. '
+             'Resolves targets the source scanner cannot name. Needs javap; '
+             'use the JDK you are migrating TO.')
+    parser.add_argument(
+        '--json', metavar='OUT.json', dest='json_path',
+        help='write the full site inventory as JSON for the fix table.')
 
-    cli_company = None
-    if '--company' in args:
-        i = args.index('--company')
-        cli_company = args[i + 1]
-        del args[i:i + 2]
-    company = resolve_company_prefixes(cli_company)
+    opts = parser.parse_args()
+
+    company = resolve_company_prefixes(opts.company)
 
     artifact = None
-    if '--bytecode' in args:
-        i = args.index('--bytecode')
-        artifact = Path(args[i + 1]).expanduser().resolve()
-        del args[i:i + 2]
+    if opts.bytecode:
+        artifact = Path(opts.bytecode).expanduser().resolve()
         if not artifact.exists():
-            sys.exit(f'no such artifact: {artifact}')
-
-    json_path = None
-    if '--json' in args:
-        i = args.index('--json')
-        json_path = args[i + 1]
-        del args[i:i + 2]
-
-    if not args:
-        sys.exit(
-            'usage: python3 reflection_audit.py [--java21] [--company PREFIX]\n'
-            '                                  [--json OUT.json] /path/to/repo [...]\n'
-            '\n'
-            '  (no flags)   original audit: pattern counts, hot files, clone check\n'
-            '  --java21     classify every site as blocking / not blocking the\n'
-            '               Java 8 -> 21 migration, and say why\n'
-            '  --company    package prefix that means "our code"; overrides\n'
-            '               COMPANY_PREFIX from the environment or .env\n'
-            '               (see .env.example; comma-separate several roots)\n'
-            '  --bytecode   jar/war/exploded-classes dir for the same code; used to\n'
-            '               resolve targets source alone cannot name (needs javap)\n'
-            '  --json       write the full site inventory as JSON for the fix table')
+            parser.error(f'no such artifact: {artifact}')
+        if not opts.java21:
+            parser.error('--bytecode only applies to --java21')
 
     roots = []
-    for arg in args:
-        root = Path(arg).resolve()
+    for arg in opts.repos:
+        root = Path(arg).expanduser().resolve()
         if not root.is_dir():
-            sys.exit(f'not a directory: {root}')
+            parser.error(f'not a directory: {root}')
         roots.append(root)
 
     # One shared type index across every repo on the command line, built
     # before any scanning. A cross-repo call only resolves if both the
     # calling repo and the declaring repo are in this set.
     declared = set()
-    if java21:
+    if opts.java21:
         for root in roots:
             declared |= collect_declared_types(list(root.rglob('*.java')))
 
     all_sites = []
     for root in roots:
-        if java21:
+        if opts.java21:
             for s in audit_java21(root, company, declared, artifact):
                 s['repo'] = root.name
                 all_sites.append(s)
         else:
             audit_repo(root)
 
-    if json_path:
-        Path(json_path).write_text(json.dumps(all_sites, indent=2))
-        print(f'\nwrote {len(all_sites)} site records -> {json_path}')
+    if opts.json_path:
+        Path(opts.json_path).write_text(json.dumps(all_sites, indent=2))
+        print(f'\nwrote {len(all_sites)} site records -> {opts.json_path}')
 
 
 if __name__ == '__main__':
