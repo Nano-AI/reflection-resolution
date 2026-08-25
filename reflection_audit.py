@@ -580,6 +580,10 @@ def scan_file_java21(path: Path, root: Path, company: str,
 
     # Pre-index setAccessible lines so we can ask "is this lookup deep?"
     # without rescanning the file for every site.
+    # The class doing the reflecting. Fixability compares its package with
+    # the target's, so it has to travel with the site.
+    owner = f'{package}.{path.stem}' if package else path.stem
+
     setacc = {n for n, l in enumerate(lines, 1) if SET_ACCESSIBLE.search(l)}
     depths = block_depths(lines)
     claimed = set()          # setAccessible lines we managed to pair up
@@ -613,6 +617,7 @@ def scan_file_java21(path: Path, root: Path, company: str,
         sites.append({
             'file': rel,
             'line': lineno,
+            'owner': owner,
             'target_fqn': fqn,
             'member': member,
             'resolution': how,
@@ -632,6 +637,7 @@ def scan_file_java21(path: Path, root: Path, company: str,
         sites.append({
             'file': rel,
             'line': n,
+            'owner': owner,
             'target_fqn': None,
             'member': None,
             'resolution': 'orphan-setAccessible',
@@ -648,7 +654,7 @@ def scan_file_java21(path: Path, root: Path, company: str,
 
 
 def audit_java21(root: Path, company: str, declared: set = None,
-                 artifact: Path = None) -> list:
+                 artifact: Path = None, want_fixability: bool = False) -> list:
     """Scan one repo and print the migration verdict. Returns the site records.
 
     `declared` is the set of types known across EVERY repo being scanned, so
@@ -721,6 +727,10 @@ def audit_java21(root: Path, company: str, declared: set = None,
         print(f'  {s["file"]}:{s["line"]}  {s["resolution"]}  {s["snippet"][:80]}')
     if len(opaque) > 15:
         print(f'  ... and {len(opaque) - 15} more (see the JSON output)')
+
+    if want_fixability and escalation and '_classes' in escalation:
+        fx_stats = assess_fixability(sites, escalation['_classes'], company)
+        report_fixability(sites, fx_stats)
 
     deprecated = [s for s in sites if s['bucket'] == 'JDK_OPEN']
     if deprecated:
@@ -896,7 +906,19 @@ def parse_javap(out: str) -> dict:
             continue
         m = JAVAP_CLASS.match(ln)
         if m:
-            cur = {'source': source, 'methods': [], 'fqn': m.group(1)}
+            # The full declaration also carries extends/implements, which is
+            # what the override-trap check walks. CLASS_DECL is the richer
+            # parse; fall back to the bare name if the line is unusual.
+            decl = CLASS_DECL.search(ln)
+            supertypes = []
+            if decl:
+                if decl.group(2):
+                    supertypes.append(decl.group(2))
+                if decl.group(3):
+                    supertypes.extend(i.strip() for i in decl.group(3).split(','))
+            cur = {'source': source, 'methods': [], 'fqn': m.group(1),
+                   'supertypes': [t for t in supertypes
+                                  if t and t != 'java.lang.Object']}
             classes[m.group(1)] = cur
             meth = None
             continue
@@ -1059,6 +1081,7 @@ def escalate(source_sites: list, artifact: Path, company: tuple) -> dict:
                 hit['target_fqn'], 'bytecode', hit['deep'], False, company,
                 hit['member'])
             s.update({
+                'owner': hit['owner'],
                 'target_fqn': hit['target_fqn'],
                 'resolution': 'bytecode',
                 'deep': hit['deep'],
@@ -1080,10 +1103,303 @@ def escalate(source_sites: list, artifact: Path, company: tuple) -> dict:
 
         return {'layout': kind, 'classes': len(fqns), 'bytecode_sites': len(bsites),
                 'matched': matched, 'upgraded': upgraded,
-                'source_only_missed': unmatched}
+                'source_only_missed': unmatched,
+                # Parsing the corpus is the expensive step; fixability needs
+                # the same disassembly, so pass it along rather than redo it.
+                '_classes': classes}
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ===========================================================================
+# Fixability assessment  (--fixability)
+# ===========================================================================
+#
+# WHAT IT ANSWERS
+#   "How many of these sites can a tool remove without a human deciding
+#   anything?" Not the same question as "which sites break on Java 21" -- this
+#   is the encapsulation cleanup, and it is where the 145 setAccessible calls
+#   actually live.
+#
+# WHY A TEXT TRANSFORM CANNOT DO THIS
+#   Deleting `setAccessible` is only safe once you have PROVEN the member is
+#   reachable without it. That proof needs the resolved target, the current
+#   modifiers, the package relationship between the hack and its target, and
+#   the subclass graph. All four come out of bytecode; none come out of source
+#   regexes.
+#
+# THE OVERRIDE TRAP (ROADMAP "widening visibility can silently change behavior")
+#   A private method is non-virtual, so a subclass method with the same
+#   signature is an independent method, not an override. Widen the parent and
+#   dispatch silently redirects to the child:
+#
+#       class Parent { private String who() { return "PARENT"; }
+#                      public  String call() { return who(); } }
+#       class Child extends Parent { public String who() { return "CHILD"; } }
+#       new Child().call()      // private -> "PARENT",  widened -> "CHILD"
+#
+#   No compile error, no warning. So any proposed widening checks every
+#   transitive subclass in the corpus for a same-name member first, and
+#   refuses if one exists.
+#
+# TIERS
+#   AUTO     the reflection is removable with NO modifier change:
+#            either the hack lives in the target class itself, or the member
+#            was already visible to it and the reflection was never needed.
+#   ASSISTED one private member widens to package-private, hack and target
+#            share a package, and no subclass shadows the name. Mechanical,
+#            blast radius one package -- still wants a human on the PR.
+#   MANUAL   everything else: target outside our code, target unresolved,
+#            cross-package (a real public-API commitment), or a gate failure.
+
+# Words javap prints before a member's type. Anything else is the type itself.
+JAVA_MODIFIERS = {
+    'public', 'protected', 'private', 'static', 'final', 'abstract',
+    'synchronized', 'native', 'transient', 'volatile', 'default', 'strictfp',
+}
+
+# `public class com.t.C extends com.t.P implements java.io.Serializable {`
+CLASS_DECL = re.compile(
+    r'\b(?:class|interface|enum)\s+([\w.$]+)'
+    r'(?:\s+extends\s+([\w.$]+))?'
+    r'(?:\s+implements\s+([\w.$,\s]+?))?\s*\{')
+
+# javap invoke/field comments: `// Method com/x/Foo.bar:()V` or `// Field a/B.c:I`.
+# The owner is omitted when the member belongs to the class being disassembled.
+INVOKE_COMMENT = re.compile(r'(?:Method|Field|InterfaceMethod) '
+                            r'(?:([\w/$]+)\.)?([\w$<>]+):')
+
+
+def split_member(sig: str):
+    """`private java.lang.String who()` -> ('private', 'who', 'java.lang.String').
+
+    Returns (visibility, name, params_or_None). params is None for fields.
+    Visibility is one of public/protected/private/package.
+    """
+    words = sig.split()
+    mods, rest = [], []
+    for i, w in enumerate(words):
+        if w in JAVA_MODIFIERS and not rest:
+            mods.append(w)
+        else:
+            rest = words[i:]
+            break
+    tail = ' '.join(rest)
+
+    visibility = next((m for m in mods
+                       if m in ('public', 'protected', 'private')), 'package')
+
+    if '(' in tail:
+        head, _, params = tail.partition('(')
+        params = params.rsplit(')', 1)[0]
+        name = head.split()[-1] if head.split() else head
+        # A constructor prints as the fully-qualified class name.
+        name = name.rsplit('.', 1)[-1]
+        return visibility, name, params
+    name = tail.split()[-1] if tail.split() else tail
+    return visibility, name.rstrip(';'), None
+
+
+def build_corpus_index(classes: dict) -> dict:
+    """One pass over the disassembly for everything the gates need.
+
+    Returns {'members', 'children', 'callers'}:
+      members  fqn -> [ {visibility, name, params, sig}, ... ]
+      children fqn -> set of DIRECT subclasses / implementors
+      callers  'owner#member' -> set of classes that reference it
+    """
+    members = {}
+    children = collections.defaultdict(set)
+    callers = collections.defaultdict(set)
+
+    for fqn, cls in classes.items():
+        members[fqn] = []
+        for m in cls['methods']:
+            vis, name, params = split_member(m['sig'])
+            members[fqn].append({'visibility': vis, 'name': name,
+                                 'params': params, 'sig': m['sig']})
+
+        for parent in cls.get('supertypes', ()):
+            children[parent].add(fqn)
+
+        for m in cls['methods']:
+            for _, _, comment in m['insns']:
+                hit = INVOKE_COMMENT.search(comment)
+                if not hit:
+                    continue
+                owner = hit.group(1).replace('/', '.') if hit.group(1) else fqn
+                callers[f'{owner}#{hit.group(2)}'].add(fqn)
+
+    return {'members': members, 'children': children, 'callers': callers}
+
+
+def transitive_subclasses(children: dict, root: str) -> set:
+    """Every class below `root`, however deep."""
+    seen, stack = set(), [root]
+    while stack:
+        cur = stack.pop()
+        for kid in children.get(cur, ()):
+            if kid not in seen:
+                seen.add(kid)
+                stack.append(kid)
+    return seen
+
+
+def package_of(fqn: str) -> str:
+    return fqn.rsplit('.', 1)[0] if '.' in fqn else ''
+
+
+def assess_site(site: dict, index: dict, company: tuple) -> dict:
+    """Run the gates for one reflective site. Returns a fixability record."""
+    target = site.get('target_fqn')
+    member = site.get('member')
+    hack = site.get('owner')
+
+    def verdict(tier, code, reason, **extra):
+        # `code` is the groupable form of `reason`; the reason names specific
+        # classes, so it can never be histogrammed on its own.
+        rec = {'tier': tier, 'code': code, 'reason': reason}
+        rec.update(extra)
+        return rec
+
+    # G1 -- we must know what is being poked.
+    if not target:
+        return verdict('MANUAL', 'unresolved', 'target not resolvable, even from bytecode')
+
+    # G2 -- we can only edit code we own.
+    if not target.startswith(company):
+        return verdict('MANUAL', 'foreign-code',
+                       'target is JDK or third-party; allowlist it or use '
+                       '--add-opens, the source is not ours to change')
+
+    if target not in index['members']:
+        return verdict('MANUAL', 'not-in-corpus',
+                       f'{target} not in the disassembled corpus; pass the jar '
+                       'that declares it')
+
+    # Match the member by name. Overloads that disagree on visibility are not
+    # something a name-only match can settle, so those escalate.
+    matches = [m for m in index['members'][target] if m['name'] == member]
+    if not matches:
+        return verdict('MANUAL', 'member-not-declared',
+                       f'member "{member}" not declared on {target} '
+                       '(inherited or synthetic)')
+    if len({m['visibility'] for m in matches}) > 1:
+        return verdict('MANUAL', 'overload-ambiguous',
+                       f'overloads of "{member}" differ in visibility; '
+                       'a name-only match cannot pick one')
+
+    visibility = matches[0]['visibility']
+    same_class = (hack == target)
+    same_package = package_of(hack) == package_of(target)
+
+    # Evidence worth attaching regardless of tier.
+    others = sorted(index['callers'].get(f'{target}#{member}', set())
+                    - {hack, target})
+
+    # G3 -- is it already reachable? Then the reflection buys nothing.
+    if same_class:
+        return verdict('AUTO', 'same-class',
+                       'hack lives in the declaring class; delete the '
+                       'reflection and call the member directly',
+                       modifier_change=None, other_callers=others)
+
+    reachable = (visibility == 'public'
+                 or (visibility in ('package', 'protected') and same_package))
+    if reachable:
+        return verdict('AUTO', 'already-visible',
+                       f'member is already {visibility} and visible from '
+                       f'{package_of(hack) or "the default package"}; the '
+                       'reflection was never needed',
+                       modifier_change=None, other_callers=others)
+
+    # A modifier change is now unavoidable, so the override trap applies.
+    shadows = sorted(sub for sub in transitive_subclasses(index['children'], target)
+                     if any(m['name'] == member for m in index['members'].get(sub, ())))
+    if shadows:
+        return verdict('MANUAL', 'override-trap',
+                       f'widening would turn {target}#{member} into a real '
+                       f'override of {shadows[0]} and silently redirect '
+                       'dispatch',
+                       shadowed_by=shadows, other_callers=others)
+
+    # G4 -- how far does the widening reach?
+    if same_package:
+        return verdict('ASSISTED', 'widen-package',
+                       f'widen {visibility} -> package-private; hack and target '
+                       'share a package, no subclass shadows the name',
+                       modifier_change=f'{visibility} -> package-private',
+                       other_callers=others)
+
+    return verdict('MANUAL', 'cross-package',
+                   f'hack is in {package_of(hack)}, target in '
+                   f'{package_of(target)}; a direct call needs the member '
+                   'public, which is an API commitment',
+                   modifier_change=f'{visibility} -> public',
+                   other_callers=others)
+
+
+def assess_fixability(sites: list, classes: dict, company: tuple) -> dict:
+    """Attach a fixability verdict to every site that has a resolved target."""
+    index = build_corpus_index(classes)
+    tiers = Counter()
+    for s in sites:
+        rec = assess_site(s, index, company)
+        s['fixability'] = rec
+        tiers[rec['tier']] += 1
+    return {'tiers': tiers, 'indexed_classes': len(index['members'])}
+
+
+def report_fixability(sites: list, stats: dict) -> None:
+    print('\n-- Fixability (encapsulation cleanup, independent of Java 21) --')
+    for tier in ('AUTO', 'ASSISTED', 'MANUAL'):
+        n = stats['tiers'].get(tier, 0)
+        blurb = {
+            'AUTO': 'delete reflection, no modifier change',
+            'ASSISTED': 'one-package widening, mechanical, human approves PR',
+            'MANUAL': 'needs a decision',
+        }[tier]
+        print(f'  {tier:<9} {n:>4}   {blurb}')
+
+    for tier in ('AUTO', 'ASSISTED'):
+        rows = [s for s in sites if s.get('fixability', {}).get('tier') == tier]
+        if not rows:
+            continue
+        print(f'\n-- {tier} sites --')
+        for s in rows:
+            fx = s['fixability']
+            print(f'  {s["file"]}:{s["line"]}')
+            print(f'    target: {s["target_fqn"]}#{s.get("member")}')
+            print(f'    action: {fx["reason"]}')
+            if fx.get('modifier_change'):
+                print(f'    change: {fx["modifier_change"]}')
+            if fx.get('other_callers'):
+                print(f'    also referenced by: {", ".join(fx["other_callers"])}')
+
+    manual = [s for s in sites if s.get('fixability', {}).get('tier') == 'MANUAL']
+    if manual:
+        print(f'\n-- MANUAL, by why ({len(manual)}) --')
+        why = Counter(s['fixability']['code'] for s in manual)
+        blurbs = {
+            'unresolved': 'target unknowable even from bytecode',
+            'foreign-code': 'JDK or third-party -- allowlist or --add-opens',
+            'not-in-corpus': 'declaring class was not in the artifact scanned',
+            'member-not-declared': 'inherited or synthetic member',
+            'overload-ambiguous': 'overloads disagree on visibility',
+            'override-trap': 'widening would silently change dispatch',
+            'cross-package': 'needs a public API commitment',
+        }
+        for code, n in why.most_common():
+            print(f'  {code:<22} {n:>4}   {blurbs.get(code, "")}')
+
+    blocked = [s for s in sites
+               if s.get('fixability', {}).get('shadowed_by')]
+    if blocked:
+        print(f'\n-- Refused: widening would change dispatch ({len(blocked)}) --')
+        for s in blocked:
+            print(f'  {s["file"]}:{s["line"]}  {s["target_fqn"]}#{s.get("member")}'
+                  f'  shadowed by {", ".join(s["fixability"]["shadowed_by"])}')
 
 
 def main() -> None:
@@ -1124,6 +1440,10 @@ def main() -> None:
              'Resolves targets the source scanner cannot name. Needs javap; '
              'use the JDK you are migrating TO.')
     parser.add_argument(
+        '--fixability', dest='fixability', action='store_true',
+        help='for each site, decide whether the reflection can be removed '
+             'mechanically: AUTO / ASSISTED / MANUAL. Requires --bytecode.')
+    parser.add_argument(
         '--json', metavar='OUT.json', dest='json_path',
         help='write the full site inventory as JSON for the fix table.')
 
@@ -1138,6 +1458,10 @@ def main() -> None:
             parser.error(f'no such artifact: {artifact}')
         if not opts.java21:
             parser.error('--bytecode only applies to --java21')
+
+    if opts.fixability and not opts.bytecode:
+        parser.error('--fixability needs --bytecode: the gates run on the '
+                     'compiled corpus, not on source')
 
     roots = []
     for arg in opts.repos:
@@ -1157,7 +1481,8 @@ def main() -> None:
     all_sites = []
     for root in roots:
         if opts.java21:
-            for s in audit_java21(root, company, declared, artifact):
+            for s in audit_java21(root, company, declared, artifact,
+                                  opts.fixability):
                 s['repo'] = root.name
                 all_sites.append(s)
         else:
