@@ -21,6 +21,7 @@ rules behind the classification.
     python3 reflection_audit.py --java21 --json sites.json /path/to/repo
 """
 
+import collections
 import os
 import re
 import sys
@@ -431,7 +432,62 @@ def resolve_target(line: str, imports: dict, wildcards: list,
     return None, 'unknown'
 
 
-def classify(fqn, how, deep, modifiers_hack, company):
+# javap answers are stable per (class, member); the subprocess is not free.
+_ACCESS_CACHE = {}
+
+# Captures the member name out of getDeclaredMethod("x") / getDeclaredField("x").
+MEMBER_NAME = re.compile(r'get(?:Declared)?(?:Method|Field)\(\s*"([^"]+)"')
+
+
+def jdk_access_is_legal(fqn: str, member: str):
+    """Would setAccessible on this JDK member succeed on Java 17+ unopened?
+
+    AccessibleObject.setAccessible succeeds when the member is public AND its
+    declaring class is public in an exported package. Every java.* package is
+    exported (just not opened), so for JDK targets the question collapses to:
+    are the class and the member both public?
+
+    That distinction matters. `Integer.class.getDeclaredMethod("toString")`
+    plus setAccessible is perfectly legal on 21 -- calling it a blocker sends
+    someone chasing a crash that will never happen. Meanwhile the members that
+    really break (Thread.threadLocals, ClassLoader.parent, the backing field of
+    an unmodifiable collection) are all non-public, which is exactly why the
+    reflection was there in the first place.
+
+    Returns True (legal), False (will throw), or None (couldn't tell).
+
+    NOTE: this asks the javap on PATH, so it describes that JDK's shape. Run it
+    under the JDK you are migrating TO for an authoritative answer.
+    """
+    key = (fqn, member)
+    if key in _ACCESS_CACHE:
+        return _ACCESS_CACHE[key]
+
+    result = None
+    try:
+        # Without -p, javap prints only the public and protected API. A member
+        # missing from that listing is not public.
+        out = subprocess.run(['javap', fqn], capture_output=True, text=True)
+        if out.returncode == 0 and out.stdout.strip():
+            lines = [ln for ln in out.stdout.splitlines()
+                     if ln.strip() and not ln.startswith('Compiled from')]
+            decl = lines[0] if lines else ''
+            if not decl.lstrip().startswith('public'):
+                result = False              # non-public class: nothing is reachable
+            elif member is None:
+                result = None               # bulk enumeration -- can't say
+            else:
+                needle = re.compile(rf'\b{re.escape(member)}\s*[(;]')
+                result = any(needle.search(ln) and 'public' in ln
+                             for ln in lines[1:])
+    except (OSError, subprocess.SubprocessError):
+        result = None
+
+    _ACCESS_CACHE[key] = result
+    return result
+
+
+def classify(fqn, how, deep, modifiers_hack, company, member=None):
     """Map a resolved target to a migration bucket.
 
     Returns (bucket, is_blocker, confidence, note).
@@ -468,14 +524,28 @@ def classify(fqn, how, deep, modifiers_hack, company):
                 '-- but it is deprecated for removal; raise a ticket')
 
     if fqn.startswith(JDK_PREFIXES):
-        if deep:
-            return ('JDK_INTERNAL', True,
-                    'low' if how == 'wildcard' else 'high',
-                    'setAccessible into a JDK module -> InaccessibleObjectException; '
-                    'fix with a supported API, or --add-opens as a stopgap')
-        return ('JDK_PUBLIC', False, 'medium',
-                'reflection into an exported JDK package without setAccessible '
-                '-- legal on 21 (verify the member really is public)')
+        if not deep:
+            return ('JDK_PUBLIC', False, 'medium',
+                    'reflection into an exported JDK package without setAccessible '
+                    '-- legal on 21 (verify the member really is public)')
+
+        # Deep access into the JDK only fails when the member is out of reach.
+        # A public member of a public class in an exported package is fine.
+        legal = jdk_access_is_legal(fqn, member)
+        if legal is True:
+            return ('JDK_PUBLIC', False, 'high',
+                    f'setAccessible on public member "{member}" of a public class '
+                    'in an exported package -- legal on 21, no --add-opens needed')
+
+        confidence = 'low' if how == 'wildcard' else (
+            'high' if legal is False else 'medium')
+        detail = ('member is not public, so the package must be opened'
+                  if legal is False else
+                  'could not confirm the member is public -- treated as a blocker')
+        return ('JDK_INTERNAL', True, confidence,
+                f'setAccessible into a JDK module ({detail}) -> '
+                'InaccessibleObjectException; fix with a supported API, '
+                'or --add-opens as a stopgap')
 
     if fqn.startswith(company):
         return ('OWN_CODE', False, 'high' if how != 'wildcard' else 'low',
@@ -522,13 +592,16 @@ def scan_file_java21(path: Path, root: Path, company: str,
 
         fqn, how = resolve_target(line, imports, wildcards, package, declared)
         hack = bool(MODIFIERS_HACK.search(line))
+        member_hit = MEMBER_NAME.search(line)
+        member = member_hit.group(1) if member_hit else None
         bucket, blocker, confidence, note = classify(
-            fqn, how, deep_at is not None, hack, company)
+            fqn, how, deep_at is not None, hack, company, member)
 
         sites.append({
             'file': rel,
             'line': lineno,
             'target_fqn': fqn,
+            'member': member,
             'resolution': how,
             'deep': deep_at is not None,
             'bucket': bucket,
@@ -547,6 +620,7 @@ def scan_file_java21(path: Path, root: Path, company: str,
             'file': rel,
             'line': n,
             'target_fqn': None,
+            'member': None,
             'resolution': 'orphan-setAccessible',
             'deep': True,
             'bucket': 'OPAQUE',
@@ -560,7 +634,8 @@ def scan_file_java21(path: Path, root: Path, company: str,
     return sites
 
 
-def audit_java21(root: Path, company: str, declared: set = None) -> list:
+def audit_java21(root: Path, company: str, declared: set = None,
+                 artifact: Path = None) -> list:
     """Scan one repo and print the migration verdict. Returns the site records.
 
     `declared` is the set of types known across EVERY repo being scanned, so
@@ -575,6 +650,12 @@ def audit_java21(root: Path, company: str, declared: set = None) -> list:
     for path in java_files:
         sites.extend(scan_file_java21(path, root, company, declared))
 
+    # Second pass: anything source couldn't resolve gets another chance
+    # against the compiled artifact, where the target is in the constant pool.
+    escalation = None
+    if artifact is not None:
+        escalation = escalate(sites, artifact, company)
+
     blockers = [s for s in sites if s['java21_blocker']]
     buckets = Counter(s['bucket'] for s in sites)
 
@@ -583,6 +664,21 @@ def audit_java21(root: Path, company: str, declared: set = None) -> list:
     print(f'{len(java_files)} java files, {len(sites)} reflection sites, '
           f'own-code prefix: {", ".join(company)}')
     print('=' * 74)
+
+    if escalation:
+        print('\n-- Bytecode escalation --')
+        if 'error' in escalation:
+            print(f'  skipped: {escalation["error"]}')
+        else:
+            print(f'  artifact layout      {escalation["layout"]}')
+            print(f'  classes disassembled {escalation["classes"]}')
+            print(f'  lookup sites in bytecode {escalation["bytecode_sites"]}')
+            print(f'  OPAQUE sites matched to bytecode {escalation["matched"]}')
+            print(f'  of those, target resolved        {escalation["upgraded"]}')
+            if escalation['source_only_missed']:
+                print(f'  bytecode sites with no source row: '
+                      f'{escalation["source_only_missed"]} '
+                      f'(source regexes missed these -- worth a look)')
 
     print('\n-- Sites by bucket --')
     for bucket, n in buckets.most_common():
@@ -599,7 +695,10 @@ def audit_java21(root: Path, company: str, declared: set = None) -> list:
         for s in blockers:
             print(f'\n  {s["file"]}:{s["line"]}  [{s["bucket"]}]'
                   f'  confidence={s["confidence"]}')
-            print(f'    target: {s["target_fqn"]}  (resolved via {s["resolution"]})')
+            shown = s["target_fqn"]
+            if s.get('member'):
+                shown += '#' + s['member']
+            print(f'    target: {shown}  (resolved via {s["resolution"]})')
             print(f'    why:    {s["note"]}')
             print(f'    code:   {s["snippet"]}')
 
@@ -619,6 +718,361 @@ def audit_java21(root: Path, company: str, declared: set = None) -> list:
     return sites
 
 
+# ===========================================================================
+# Bytecode escalation  (--bytecode ARTIFACT)
+# ===========================================================================
+#
+# WHY THIS EXISTS
+#   The source scanner resolves a target only when the call site names it on
+#   one line -- `Foo.class.getDeclaredMethod(...)` or a Class.forName string
+#   literal. Real code usually doesn't:
+#
+#       Class<?> c = resolveSomehow();      // or Foo.class, several lines up
+#       Method m = c.getDeclaredMethod("x");   <-- receiver is a variable
+#       m.setAccessible(true);
+#
+#   Those land in OPAQUE, and a corpus can easily be 80% OPAQUE. That isn't a
+#   finding, it's a blind spot: a migration verdict built on the resolved
+#   minority understates the blocker count.
+#
+#   Compiled bytecode has the answer. `Foo.class` compiles to an `ldc` of a
+#   constant-pool *class* entry, and Class.forName("a.b.C") to an `ldc` of a
+#   String, both of which survive into the .class file no matter how many
+#   locals the source put in between. Walking backwards from the lookup call
+#   recovers the target exactly, with no type inference and no guessing.
+#
+# WHAT IT CANNOT DO
+#   `obj.getClass().getDeclaredField(...)` has no constant-pool target -- the
+#   class is whatever showed up at runtime. Those stay OPAQUE, correctly.
+#
+# LAYOUT RULES (from ROADMAP "artifact -> own_classes / dependency_jars")
+#   Fat jars carry other people's classes. Getting this wrong means auditing
+#   Spring Boot's loader or a bundled dependency and calling it our code.
+#     BOOT-INF/classes/ present -> Spring Boot fat jar; own code lives there
+#     WEB-INF/classes/  present -> WAR; own code lives there
+#     neither                   -> plain jar; classes at the root are own code
+#   Root classes count as own code ONLY in the plain-jar case.
+
+import shutil
+import subprocess
+import tempfile
+import zipfile
+
+# Class methods whose result is a Method/Field/Constructor we might force open.
+BYTECODE_LOOKUPS = (
+    'getDeclaredMethod', 'getMethod', 'getDeclaredField', 'getField',
+    'getDeclaredConstructor', 'getConstructor',
+    'getDeclaredMethods', 'getMethods', 'getDeclaredFields', 'getFields',
+    'getDeclaredConstructors', 'getConstructors',
+)
+
+# javap output shapes.
+JAVAP_INSN = re.compile(r'^\s+(\d+): (\S+)(?:\s+#\d+)?(?:\s+// (.*))?$')
+JAVAP_LINE = re.compile(r'^\s+line (\d+): (\d+)$')
+JAVAP_MEMBER = re.compile(r'^  (?!Code:|LineNumberTable|LocalVariableTable|'
+                          r'Exception table:|StackMapTable:|Signature:)(\S.*);$')
+JAVAP_CLASS = re.compile(r'^[\w\s]*\b(?:class|interface|enum) ([\w.$]+)')
+JAVAP_SOURCE = re.compile(r'^Compiled from "(.+)"$')
+
+# How far back through a method's instructions to look for the target class.
+# Bounded so a class literal belonging to some unrelated earlier statement
+# can't be mistaken for this call's receiver.
+BACKSCAN_LIMIT = 60
+
+# javap takes class names as arguments, so very large corpora would blow the
+# command-line length limit. Batch them; process startup dominates anyway.
+JAVAP_BATCH = 150
+
+
+def detect_layout(artifact: Path):
+    """Classify an artifact and say where its OWN classes live.
+
+    Returns (kind, own_prefix) where own_prefix is a path prefix inside the
+    archive ('' means the archive root). See the layout rules above.
+    """
+    if artifact.is_dir():
+        return 'dir', ''
+    if not zipfile.is_zipfile(artifact):
+        return 'unknown', ''
+    with zipfile.ZipFile(artifact) as z:
+        names = z.namelist()
+    if any(n.startswith('BOOT-INF/classes/') for n in names):
+        return 'boot', 'BOOT-INF/classes/'
+    if any(n.startswith('WEB-INF/classes/') for n in names):
+        return 'war', 'WEB-INF/classes/'
+    return 'plain', ''
+
+
+def stage_own_classes(artifact: Path, kind: str, own_prefix: str):
+    """Give javap a directory whose root is the package root.
+
+    A plain jar or an exploded directory already is one. Boot/WAR layouts bury
+    classes under a prefix that `javap -classpath` cannot see through, so those
+    entries get extracted to a temp dir first.
+
+    Returns (classpath_for_javap, tempdir_to_clean_up_or_None).
+    """
+    if kind in ('dir', 'plain'):
+        return str(artifact), None
+
+    tmp = Path(tempfile.mkdtemp(prefix='reflection-audit-'))
+    with zipfile.ZipFile(artifact) as z:
+        for name in z.namelist():
+            if not name.startswith(own_prefix) or not name.endswith('.class'):
+                continue
+            rel = name[len(own_prefix):]
+            dest = tmp / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(z.read(name))
+    return str(tmp), tmp
+
+
+def own_class_names(classpath_root: str) -> list:
+    """Every class FQN under a package root, inner classes included.
+
+    Inner classes matter: an anonymous `Foo$1` holds its own bytecode, so a
+    reflection site inside one is invisible if only `Foo` is disassembled.
+
+    The root is a directory for exploded classes and for Boot/WAR layouts
+    (which get staged into one), but a plain jar is handed to javap as-is --
+    so that case enumerates out of the archive instead of walking the disk.
+    """
+    root = Path(classpath_root)
+    if root.is_dir():
+        entries = ['/'.join(path.relative_to(root).parts)
+                   for path in root.rglob('*.class')]
+    else:
+        with zipfile.ZipFile(root) as z:
+            entries = [n for n in z.namelist() if n.endswith('.class')]
+
+    names = []
+    for entry in entries:
+        if entry.startswith('META-INF/'):
+            continue
+        fqn = entry[:-len('.class')].replace('/', '.')
+        if fqn.endswith('module-info') or fqn.endswith('package-info'):
+            continue
+        names.append(fqn)
+    return sorted(names)
+
+
+def disassemble(classpath: str, fqns: list) -> str:
+    """Run javap over many classes at once and concatenate the output."""
+    chunks = []
+    for i in range(0, len(fqns), JAVAP_BATCH):
+        batch = fqns[i:i + JAVAP_BATCH]
+        proc = subprocess.run(
+            ['javap', '-p', '-c', '-l', '-classpath', classpath, *batch],
+            capture_output=True, text=True)
+        chunks.append(proc.stdout)
+    return '\n'.join(chunks)
+
+
+def parse_javap(out: str) -> dict:
+    """javap text -> {class_fqn: {source, methods: [{sig, insns, lines}]}}.
+
+    insns entries are (offset, opcode, comment); the comment is where javap
+    prints the resolved constant-pool entry, which is the part we actually
+    care about.
+    """
+    classes, cur, meth, source = {}, None, None, None
+    for ln in out.splitlines():
+        m = JAVAP_SOURCE.match(ln)
+        if m:
+            source = m.group(1)
+            continue
+        m = JAVAP_CLASS.match(ln)
+        if m:
+            cur = {'source': source, 'methods': [], 'fqn': m.group(1)}
+            classes[m.group(1)] = cur
+            meth = None
+            continue
+        if cur is None:
+            continue
+        m = JAVAP_MEMBER.match(ln)
+        if m:
+            meth = {'sig': m.group(1), 'insns': [], 'lines': []}
+            cur['methods'].append(meth)
+            continue
+        if meth is None:
+            continue
+        m = JAVAP_INSN.match(ln)
+        if m:
+            meth['insns'].append((int(m.group(1)), m.group(2), m.group(3) or ''))
+            continue
+        m = JAVAP_LINE.match(ln)
+        if m:
+            meth['lines'].append((int(m.group(2)), int(m.group(1))))
+    return classes
+
+
+def source_line(meth: dict, offset: int):
+    """Map an instruction offset to a source line via the LineNumberTable."""
+    best = None
+    for off, line in sorted(meth['lines']):
+        if off <= offset:
+            best = line
+    return best
+
+
+def resolve_from_constant_pool(insns: list, idx: int):
+    """Walk backwards from a lookup call to find the class it targets.
+
+    javac emits the receiver first, then the member name, then the parameter
+    types, so scanning backwards the order is reversed: parameter class
+    literals, then the member String, then the receiver class literal. That
+    ordering is what tells a parameter type apart from the target -- exactly
+    the trick examples/decide.py uses.
+
+    Returns (target_fqn_or_None, member_name_or_None).
+    """
+    target = member = None
+    stop = max(0, idx - BACKSCAN_LIMIT)
+    for j in range(idx - 1, stop - 1, -1):
+        op, comment = insns[j][1], insns[j][2]
+
+        # Another reflective lookup means we've walked into a previous
+        # statement; its operands are not ours.
+        if any(f'java/lang/Class.{L}' in comment for L in BYTECODE_LOOKUPS):
+            break
+
+        if op.startswith('ldc') and comment.startswith('String ') and member is None:
+            member = comment[len('String '):]
+            continue
+
+        if op.startswith('ldc') and comment.startswith('class '):
+            fqn = comment[len('class '):].replace('/', '.')
+            if member is None:
+                continue                       # a parameter type, not the target
+            if target is None and fqn != 'java.lang.Class':
+                target = fqn
+            continue
+
+        # Class.forName("a.b.C") -- the name is an ldc String just before it.
+        if 'java/lang/Class.forName' in comment and target is None:
+            for k in range(j - 1, max(0, j - 10) - 1, -1):
+                if insns[k][1].startswith('ldc') and insns[k][2].startswith('String '):
+                    target = insns[k][2][len('String '):]
+                    break
+    return target, member
+
+
+def is_deep(insns: list, idx: int) -> bool:
+    """Does the object this lookup returned get setAccessible(true) called on it?
+
+    Scans forward to the next lookup (or the end of the method) rather than a
+    fixed window, so it tracks the actual statement boundary.
+    """
+    for j in range(idx + 1, len(insns)):
+        comment = insns[j][2]
+        if 'setAccessible' in comment:
+            return True
+        if any(f'java/lang/Class.{L}' in comment for L in BYTECODE_LOOKUPS):
+            return False
+    return False
+
+
+def bytecode_sites(classes: dict) -> list:
+    """Every reflective lookup found in bytecode, with its resolved target."""
+    sites = []
+    for fqn, cls in classes.items():
+        if not cls['source']:
+            continue
+        package = fqn.rsplit('.', 1)[0] if '.' in fqn else ''
+        # Where this class's source sits relative to the package root, e.g.
+        # com/example/app/TypeUtil.java -- the key we join to the source scan.
+        src_key = (package.replace('.', '/') + '/' + cls['source']).lstrip('/')
+        for meth in cls['methods']:
+            for i, (off, op, comment) in enumerate(meth['insns']):
+                if not any(f'java/lang/Class.{L}' in comment
+                           for L in BYTECODE_LOOKUPS):
+                    continue
+                target, member = resolve_from_constant_pool(meth['insns'], i)
+                sites.append({
+                    'src_key': src_key,
+                    'basename': cls['source'],
+                    'line': source_line(meth, off),
+                    'owner': fqn,
+                    'target_fqn': target,
+                    'member': member,
+                    'deep': is_deep(meth['insns'], i),
+                })
+    return sites
+
+
+def build_resolution_index(sites: list) -> dict:
+    """(source basename, line) -> [site, ...] for joining back to source rows."""
+    index = collections.defaultdict(list)
+    for s in sites:
+        if s['line'] is not None:
+            index[(s['basename'], s['line'])].append(s)
+    return index
+
+
+def escalate(source_sites: list, artifact: Path, company: tuple) -> dict:
+    """Re-resolve OPAQUE source sites using the compiled artifact.
+
+    Mutates source_sites in place. Returns a stats dict for the report.
+    """
+    kind, own_prefix = detect_layout(artifact)
+    if kind == 'unknown':
+        return {'error': f'{artifact} is neither a directory nor a jar/war'}
+
+    classpath, tmp = stage_own_classes(artifact, kind, own_prefix)
+    try:
+        fqns = own_class_names(classpath)
+        if not fqns:
+            return {'error': f'no .class files found in {artifact} (layout={kind})'}
+        classes = parse_javap(disassemble(classpath, fqns))
+        bsites = bytecode_sites(classes)
+        index = build_resolution_index(bsites)
+
+        upgraded = matched = 0
+        for s in source_sites:
+            if s['bucket'] != 'OPAQUE':
+                continue
+            # Join on file name + line, then confirm the package path agrees --
+            # two classes can share a basename across packages.
+            src_path = s['file'].replace('\\', '/')
+            candidates = [b for b in index.get((Path(src_path).name, s['line']), [])
+                          if src_path.endswith(b['src_key'])]
+            if not candidates:
+                continue
+            matched += 1
+            hit = candidates[0]
+            if not hit['target_fqn']:
+                continue                      # genuinely runtime-typed; leave OPAQUE
+            bucket, blocker, confidence, note = classify(
+                hit['target_fqn'], 'bytecode', hit['deep'], False, company,
+                hit['member'])
+            s.update({
+                'target_fqn': hit['target_fqn'],
+                'resolution': 'bytecode',
+                'deep': hit['deep'],
+                'bucket': bucket,
+                'java21_blocker': blocker,
+                'confidence': confidence,
+                'note': note,
+                'member': hit['member'],
+            })
+            upgraded += 1
+
+        # Bytecode sites with no source row are a coverage warning: the source
+        # scanner's regexes missed a call shape it should have caught.
+        src_keys = {(Path(s['file'].replace('\\', '/')).name, s['line'])
+                    for s in source_sites}
+        unmatched = sum(1 for b in bsites
+                        if b['line'] is not None
+                        and (b['basename'], b['line']) not in src_keys)
+
+        return {'layout': kind, 'classes': len(fqns), 'bytecode_sites': len(bsites),
+                'matched': matched, 'upgraded': upgraded,
+                'source_only_missed': unmatched}
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> None:
     args = sys.argv[1:]
 
@@ -632,6 +1086,14 @@ def main() -> None:
         cli_company = args[i + 1]
         del args[i:i + 2]
     company = resolve_company_prefixes(cli_company)
+
+    artifact = None
+    if '--bytecode' in args:
+        i = args.index('--bytecode')
+        artifact = Path(args[i + 1]).expanduser().resolve()
+        del args[i:i + 2]
+        if not artifact.exists():
+            sys.exit(f'no such artifact: {artifact}')
 
     json_path = None
     if '--json' in args:
@@ -650,6 +1112,8 @@ def main() -> None:
             '  --company    package prefix that means "our code"; overrides\n'
             '               COMPANY_PREFIX from the environment or .env\n'
             '               (see .env.example; comma-separate several roots)\n'
+            '  --bytecode   jar/war/exploded-classes dir for the same code; used to\n'
+            '               resolve targets source alone cannot name (needs javap)\n'
             '  --json       write the full site inventory as JSON for the fix table')
 
     roots = []
@@ -670,7 +1134,7 @@ def main() -> None:
     all_sites = []
     for root in roots:
         if java21:
-            for s in audit_java21(root, company, declared):
+            for s in audit_java21(root, company, declared, artifact):
                 s['repo'] = root.name
                 all_sites.append(s)
         else:
