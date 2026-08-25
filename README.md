@@ -37,9 +37,28 @@ Rule: throwaway analysis = Python. Portfolio-grade tool = C++.
     precedence, checked against a type index built from every repo passed) and
     buckets it as blocking / not blocking the 8 → 21 move. Pass both repos on
     one command line so cross-repo targets resolve.
+  - Bytecode escalation: add `--bytecode /path/to/app.jar` (or a `.war`, or an
+    exploded classes dir). Source can only resolve a target it names on one
+    line; most real call sites put the class in a variable first. Compiled
+    bytecode keeps the target in the constant pool, so a backward scan from the
+    lookup recovers it exactly. Layout is detected per artifact — `BOOT-INF/`,
+    `WEB-INF/`, or plain jar — and only own classes are read. Needs `javap`.
   - `examples/java21/` — fixture covering all eight buckets. Run
     `python3 reflection_audit.py --java21 --company com.example examples/java21`
     to see expected output: 4 blockers, 3 in the human queue.
+  - `examples/bytecode/` — fixture for the escalation. Shows why source alone
+    is not enough:
+
+    ```
+    javac -d /tmp/fx examples/bytecode/com/example/app/*.java
+
+    # source only  -> 0 blockers, 5 opaque
+    python3 reflection_audit.py --java21 --company com.example examples/bytecode
+
+    # with bytecode -> 2 blockers found, 1 opaque left (genuinely runtime-typed)
+    python3 reflection_audit.py --java21 --company com.example \
+        --bytecode /tmp/fx examples/bytecode
+    ```
 
 ## Plan
 
@@ -80,5 +99,12 @@ visible statically. Everything else → human queue with tool-computed evidence
 - 0 hits in test paths → reflection lives in production code, not a test cheat.
 - Only `setAccessible` bypasses `private`; `forName`/`newInstance` on public members
   respect modifiers. The visibility problem is the `setAccessible` sites, not the rest.
+- `setAccessible` into the JDK is **not** automatically a Java 21 blocker. It succeeds
+  when the member is public and its class is public in an exported package, so the
+  classifier checks the member with `javap` before calling anything a blocker. Run it
+  under the JDK you are migrating TO for an authoritative answer.
+- A high OPAQUE count is a tooling gap, not a finding. Any blocker count taken from a
+  source-only scan is a floor: the escalation fixture reports 0 blockers from source
+  and 2 once bytecode is read.
 - Java rules that bound any fix: can't reduce visibility of overridden methods;
   interface implementations stay public.
